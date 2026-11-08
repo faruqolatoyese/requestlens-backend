@@ -1,4 +1,4 @@
-# RequestLens — Real-Time API Observability & Alerting Engine (Backend)
+# RequestLens: Real-Time API Observability & Alerting Engine (Backend)
 
 **RequestLens** is a real-time API monitoring, telemetry ingestion, and automated alerting platform built for modern engineering teams. This repository (**`requestlens-backend`**) powers the telemetry ingestion API, real-time WebSocket streaming server, analytics aggregation engine, and asynchronous `5xx` incident alerting worker.
 
@@ -21,7 +21,7 @@
 
 ## The Problem We Are Solving
 
-Engineering teams frequently face silent API degradations—such as creeping endpoint latency, unexpected traffic spikes, or sudden `5xx` error surges—that go unnoticed until end-users report broken workflows. Traditional APM tools are often heavyweight, expensive, and complex to set up.
+Engineering teams frequently face silent API degradations such as creeping endpoint latency, unexpected traffic spikes, or sudden `5xx` error surges that go unnoticed until end-users report broken workflows. Traditional APM tools are often heavyweight, expensive, and complex to set up.
 
 **RequestLens** solves this with a lightweight, real-time backend architecture:
 1. **Low-Overhead Telemetry Ingestion:** Client apps (Express, FastAPI, cURL, or the dashboard's Log Simulator) send lightweight request metrics (`endpointId`, `statusCode`, `responseTime`) to `POST /api/logs` using a project `API Key`.
