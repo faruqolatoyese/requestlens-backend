@@ -1,6 +1,6 @@
-# RequestLens — Real-Time API Observability, Telemetry Ingestion & Alerting Engine (Backend)
+# RequestLens — Real-Time API Observability & Alerting Engine (Backend)
 
-**RequestLens** is a real-time API monitoring, telemetry ingestion, and automated alerting platform built for modern engineering teams. This repository (**`requestlens-backend`**) powers the core telemetry ingestion pipeline, real-time WebSocket streaming server, analytical aggregation engine, and asynchronous `5xx` incident alerting worker.
+**RequestLens** is a real-time API monitoring, telemetry ingestion, and automated alerting platform built for modern engineering teams. This repository (**`requestlens-backend`**) powers the telemetry ingestion API, real-time WebSocket streaming server, analytics aggregation engine, and asynchronous `5xx` incident alerting worker.
 
 > **Multi-Repository Architecture**
 > - **Backend Repository (This Repo):** [faruqolatoyese/requestlens-backend](https://github.com/faruqolatoyese/requestlens-backend)
@@ -21,243 +21,69 @@
 
 ## The Problem We Are Solving
 
-Engineering teams frequently face silent API degradations—such as creeping endpoint latency, unexpected traffic spikes, or sudden `5xx` error surges—that go unnoticed until end-users report broken workflows. Traditional Application Performance Monitoring (APM) suites are often heavyweight, expensive, and require complex infrastructure agents.
+Engineering teams frequently face silent API degradations—such as creeping endpoint latency, unexpected traffic spikes, or sudden `5xx` error surges—that go unnoticed until end-users report broken workflows. Traditional APM tools are often heavyweight, expensive, and complex to set up.
 
-**RequestLens** solves this with a streamlined, developer-first observability architecture:
-1. **High-Throughput, Low-Overhead Telemetry Ingestion:** Client applications (Express, FastAPI, cURL, or the dashboard's built-in Log Simulator) push lightweight HTTP telemetry payloads (`endpointId`, `statusCode`, `responseTime`) to `POST /api/logs` authenticated via a project-scoped `API Key`.
-2. **Instant Real-Time WebSocket Streaming:** Instead of polling or waiting for delayed log indexing, the backend broadcasts newly persisted `ApiLog` records directly to authorized browser clients over **Socket.IO** project rooms (`new_log`), updating dashboard charts and log tables the millisecond a request finishes.
-3. **Non-Blocking Asynchronous `5xx` Alerting:** Every ingested log triggers an asynchronous threshold evaluation (`evaluateAlerts`) that never blocks the HTTP response. When `5xx` server errors breach user-configured rules over a sliding window, jobs are queued into **BullMQ (Redis)** with exponential backoff and dispatched as rich HTML incident reports via **Resend**.
-4. **Built-In Self-Monitoring Middleware:** RequestLens includes an optional `monitorMiddleware` capable of dogfooding its own telemetry pipeline—auto-discovering routes and streaming live performance metrics without external instrumentation.
-
----
-
-## System Architecture & End-to-End Data Flow
-
-RequestLens is split into two decoupled services (**`requestlens-backend`** and **`requestlens-frontend`**) communicating over REST APIs and persistent WebSocket channels.
-
-```mermaid
-flowchart TD
-    subgraph ClientApps["Monitored Client Applications"]
-        EXT["External APIs (Express / FastAPI / cURL)"]
-        SIM["Dashboard Log Simulator"]
-    end
-
-    subgraph Backend["RequestLens Backend (Express 5 + TypeScript)"]
-        INGEST["POST /api/logs (apiKeyMiddleware)"]
-        REST["REST API (/api/auth, /api/projects, /api/stats, /api/alerts)"]
-        WS["Socket.IO Server (JWT Handshake + Project Rooms)"]
-        ALERT_EVAL["Async Alert Evaluator (evaluateAlerts)"]
-        BULL["BullMQ Queue: 'alert-emails'"]
-        WORKER["BullMQ Worker (Resend HTML Emails)"]
-    end
-
-    subgraph Database["Persistence & Queue Layer"]
-        PG[("PostgreSQL (Prisma ORM)")]
-        REDIS[("Redis (ioredis)")]
-    end
-
-    subgraph Frontend["RequestLens Frontend (Next.js 16 App Router)"]
-        UI["Dashboard UI (Recharts + Radix UI)"]
-        RQ["TanStack React Query Cache"]
-        HOOK["useSocket Hook (socket.io-client)"]
-    end
-
-    EXT -->|"Bearer <API_KEY>"| INGEST
-    SIM -->|"Bearer <API_KEY>"| INGEST
-    INGEST -->|"1. Persist ApiLog"| PG
-    INGEST -->|"2. Emit 'new_log' to projectId room"| WS
-    INGEST -->|"3. Trigger non-blocking check"| ALERT_EVAL
-
-    ALERT_EVAL -->|"Check window, minRequests & cooldown"| PG
-    ALERT_EVAL -->|"Breach detected: Record AlertLog & Enqueue"| BULL
-    BULL <--> REDIS
-    BULL --> WORKER
-
-    WS ==>|"Real-time 'new_log' event"| HOOK
-    HOOK -->|"Invalidate queries"| RQ
-    RQ <-->|"Bearer <JWT> REST calls"| REST
-    REST <--> PG
-    RQ --> UI
-```
+**RequestLens** solves this with a lightweight, real-time backend architecture:
+1. **Low-Overhead Telemetry Ingestion:** Client apps (Express, FastAPI, cURL, or the dashboard's Log Simulator) send lightweight request metrics (`endpointId`, `statusCode`, `responseTime`) to `POST /api/logs` using a project `API Key`.
+2. **Instant Real-Time Streaming:** Instead of polling, the backend broadcasts newly recorded logs directly to authorized browser clients over **Socket.IO** project rooms (`new_log`), updating dashboard charts and log tables immediately.
+3. **Noise-Free Asynchronous Alerting:** Every ingested log triggers a non-blocking `5xx` threshold check (`evaluateAlerts`). When an error spike breaches a rule, jobs are queued into **BullMQ (Redis)** with exponential backoff and sent as HTML incident emails via **Resend**.
 
 ---
 
-## Core Backend Subsystems
+## System Architecture & How It Works
 
-### 1. Dual Authentication & Authorization (`JWT` + `API Key`)
-RequestLens separates control-plane management from data-plane telemetry ingestion:
-- **Control Plane (`authMiddleware` — `Bearer <JWT>`):**
-  - Supports both **Local Email/Password** (`bcrypt` salted hashes) and **Google OAuth 2.0** (`google-auth-library` verifying Google ID tokens on `/api/auth/google`, with automatic account linking if an email already exists).
-  - Issues a 24-hour signed JWT (`{ userId }`) used across all `/api/projects/*` REST endpoints and the Socket.IO connection handshake.
-  - Every service query strictly scopes lookups by `{ id: projectId, userId }` to enforce multi-tenant isolation.
-- **Data Plane (`apiKeyMiddleware` — `Bearer <API_KEY>`):**
-  - When a project is created, the backend generates a cryptographically secure 64-character hex secret (`crypto.randomBytes(32).toString("hex")`) stored in the `ApiKey` table (alongside a default `5xx` alert rule).
-  - Incoming requests to `POST /api/logs` authenticate via `Authorization: Bearer <API_KEY>`. The middleware resolves and attaches `req.projectId` and verifies that the target `endpointId` belongs to that project.
+RequestLens separates **Control Plane** (dashboard management) from **Data Plane** (telemetry ingestion):
 
-### 2. Real-Time Telemetry Streaming (`Socket.IO`)
-- **Authenticated Handshake:** Clients connect with `socket.handshake.auth.token`. The Socket.IO middleware verifies the JWT and attaches `socket.data.userId`.
-- **Authorized Project Rooms:** When the frontend emits `join_project` with a `projectId`, the server queries PostgreSQL to verify that `userId` owns `projectId` before calling `socket.join(projectId)`.
-- **Instant Broadcast:** As soon as `logResponse` (or `monitorMiddleware`) creates an `ApiLog` row in PostgreSQL, `emitNewLog(projectId, log)` broadcasts the enriched log (including `endpoint.name`, `endpoint.path`, and `endpoint.method`) to all connected sockets in that project's room.
-
-### 3. Analytical Aggregation Engine (`stats.service.ts`)
-`GET /api/projects/:projectId/stats` computes dashboard observability metrics in a single request:
-- **Global KPIs:** Total requests, failed requests (`statusCode >= 400`), and overall success rate percentage.
-- **7-Day Traffic Time-Series (`chartData`):** Zero-filled daily buckets for the last 7 days breaking down `total`, `successful` (`< 400`), and `failed` (`>= 400`) requests.
-- **Per-Endpoint Performance Breakdown (`endpointStats`):** Uses Prisma `groupBy` aggregations (`_count`, `_avg.responseTime`) to compute per-route request volume, failure count, success rate (`%`), and rounded average latency (`ms`).
-
-### 4. Asynchronous `5xx` Alerting Pipeline (`BullMQ` + `Redis` + `Resend`)
-- **Non-Blocking Evaluation:** After saving a log, `evaluateAlerts(projectId)` runs asynchronously in the background so `POST /api/logs` returns immediately.
-- **Noise-Free Guards:** For each active `AlertRule` on the project:
-  1. **Cooldown Check:** Queries `AlertLog` for any trigger within the last `cooldownMinutes` (default `30m`). If found, evaluation skips the rule to prevent inbox flooding.
-  2. **Minimum Volume Guard:** Counts total requests across the project within the sliding `windowMinutes` (default `5m`). If `totalRequests < rule.minRequests` (default `10`), evaluation skips to avoid false positives on low traffic.
-  3. **Threshold Check:** Calculates the `5xx` server error rate (`statusCode >= 500`). If `errorRate >= rule.thresholdPercentage` (default `5.0%`), the rule triggers.
-- **Reliable Queue & Worker Delivery:**
-  - Triggering creates an `AlertLog` record (activating the cooldown), aggregates failing endpoints by `method` + `path`, and enqueues a job in the `alert-emails` **BullMQ** queue with **5 retry attempts** and **exponential backoff** (`5s`, `10s`, `20s`, ...).
-  - `alertEmailWorker` (`concurrency: 2`) consumes the queue and sends a formatted HTML incident report via **Resend** featuring breached metrics, failing endpoint counts, and cooldown status.
-
----
-
-## Database Schema (PostgreSQL + Prisma ORM)
-
-```mermaid
-erDiagram
-    User ||--o{ Project : "owns"
-    Project ||--o{ Endpoint : "monitors"
-    Project ||--o{ ApiKey : "authenticates via"
-    Project ||--o{ AlertRule : "evaluates"
-    Endpoint ||--o{ ApiLog : "records"
-    AlertRule ||--o{ AlertLog : "triggers"
-
-    User {
-        uuid id PK
-        string email UK
-        string password "Nullable for Google OAuth"
-        string name
-        string avatar
-        string provider "LOCAL | GOOGLE"
-        string googleId UK
-        datetime createdAt
-        datetime updatedAt
-    }
-
-    Project {
-        uuid id PK
-        string name
-        string description
-        uuid userId FK
-        datetime createdAt
-        datetime updatedAt
-    }
-
-    Endpoint {
-        uuid id PK
-        string name
-        string path
-        enum method "GET | POST | PUT | PATCH | DELETE"
-        uuid projectId FK
-        datetime createdAt
-        datetime updatedAt
-    }
-
-    ApiLog {
-        uuid id PK
-        int statusCode
-        int responseTime "Latency in ms"
-        datetime timestamp
-        uuid endpointId FK
-    }
-
-    ApiKey {
-        uuid id PK
-        string key UK "64-char hex secret"
-        uuid projectId FK
-        datetime createdAt
-    }
-
-    AlertRule {
-        uuid id PK
-        string name
-        float thresholdPercentage "Default 5.0 (%)"
-        int windowMinutes "Default 5"
-        int cooldownMinutes "Default 30"
-        int minRequests "Default 10"
-        boolean active "Default true"
-        uuid projectId FK
-    }
-
-    AlertLog {
-        uuid id PK
-        float errorRate
-        int totalRequests
-        datetime triggeredAt
-        uuid alertRuleId FK
-    }
-```
-
----
-
-## REST API & WebSocket Reference
-
-> Interactive documentation is available at [`/api-docs`](https://requestlens-backend.onrender.com/api-docs).
-
-### Authentication (`/api/auth`)
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :---: | :--- |
-| `POST` | `/api/auth/register` | Public | Register a new account with `{ email, password }` and receive a JWT |
-| `POST` | `/api/auth/login` | Public | Authenticate with `{ email, password }` and receive a JWT |
-| `POST` | `/api/auth/google` | Public | Verify a Google OAuth `{ idToken }`, provision/link user, and receive a JWT |
-
-### Projects & Analytics (`/api/projects`)
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :---: | :--- |
-| `GET` | `/api/projects` | `Bearer <JWT>` | List all projects and associated API keys for the authenticated user |
-| `POST` | `/api/projects` | `Bearer <JWT>` | Create a project, generate its 64-char `ApiKey`, and seed a default `AlertRule` |
-| `GET` | `/api/projects/:id` | `Bearer <JWT>` | Retrieve details and API keys for a specific project |
-| `DELETE` | `/api/projects/:id` | `Bearer <JWT>` | Delete a project and cascade-delete its endpoints, logs, keys, and alerts |
-| `GET` | `/api/projects/:id/logs` | `Bearer <JWT>` | Fetch paginated request logs (`?page=1&limit=10`) ordered by newest first |
-| `GET` | `/api/projects/:projectId/stats` | `Bearer <JWT>` | Fetch KPI totals, 7-day traffic chart data, and per-endpoint latency/error stats |
-
-### Monitored Endpoints (`/api/projects/:projectId/endpoints`)
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :---: | :--- |
-| `GET` | `/api/projects/:projectId/endpoints` | `Bearer <JWT>` | List all registered HTTP endpoints under a project |
-| `POST` | `/api/projects/:projectId/endpoints` | `Bearer <JWT>` | Register a new endpoint (`{ name, path, method }`) |
-| `GET` | `/api/projects/:projectId/endpoints/:endpointId` | `Bearer <JWT>` | Get details for a specific registered endpoint |
-| `DELETE` | `/api/projects/:projectId/endpoints/:endpointId` | `Bearer <JWT>` | Delete a registered endpoint and cascade-delete its logs |
-
-### Alert Rules (`/api/projects/:projectId/alerts`)
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :---: | :--- |
-| `GET` | `/api/projects/:projectId/alerts` | `Bearer <JWT>` | List all `5xx` alert rules configured for a project |
-| `POST` | `/api/projects/:projectId/alerts` | `Bearer <JWT>` | Create a new alert rule (`name`, `thresholdPercentage`, `windowMinutes`, `cooldownMinutes`, `minRequests`) |
-| `PATCH` | `/api/projects/:projectId/alerts/:ruleId` | `Bearer <JWT>` | Toggle or explicitly set the `active` boolean state of an alert rule |
-| `DELETE` | `/api/projects/:projectId/alerts/:ruleId` | `Bearer <JWT>` | Delete an alert rule |
-
-### Telemetry Ingestion (`/api/logs`)
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :---: | :--- |
-| `POST` | `/api/logs` | `Bearer <API_KEY>` | Ingest a request log (`{ endpointId, statusCode, responseTime }`), broadcast via Socket.IO, and evaluate alerts |
-
-### WebSocket Events (`Socket.IO`)
-| Event | Direction | Payload | Description |
-| :--- | :---: | :--- | :--- |
-| `join_project` | Client -> Server | `projectId: string` | Verifies project ownership and subscribes the socket to the `projectId` room |
-| `leave_project` | Client -> Server | `projectId: string` | Leaves the `projectId` room |
-| `joined` / `left` | Server -> Client | `projectId: string` | Confirmation of room subscription state change |
-| `new_log` | Server -> Client | `ApiLog` (with `endpoint`) | Broadcasts immediately when a new telemetry log is recorded for `projectId` |
-| `error_msg` | Server -> Client | `message: string` | Emitted if room authorization fails or `projectId` is invalid |
+1. **Dual Authentication (`JWT` + `API Key`):**
+   - **Dashboard Auth (`Bearer <JWT>`):** Users authenticate via Email/Password (`bcrypt`) or **Google OAuth 2.0** (`google-auth-library`). A signed 24-hour JWT secures all `/api/projects/*` routes and the Socket.IO handshake.
+   - **Ingestion Auth (`Bearer <API_KEY>`):** Creating a project provisions a unique 64-character hex `ApiKey` (plus a default `5xx` alert rule). `apiKeyMiddleware` validates this key on `POST /api/logs` and resolves the target `projectId`.
+2. **Real-Time WebSocket Rooms (`Socket.IO`):**
+   - Dashboard clients connect with their JWT and emit `join_project` with a `projectId`.
+   - The server verifies project ownership in PostgreSQL before joining the socket to the isolated `projectId` room, where `new_log` events are broadcast in real time.
+3. **Analytics Aggregation (`GET /api/projects/:projectId/stats`):**
+   - Computes total requests, failed requests (`>= 400`), overall success rate, 7-day daily traffic buckets (`chartData`), and per-endpoint average latency and failure rates using Prisma `groupBy` queries.
+4. **Asynchronous `5xx` Alerting Pipeline (`BullMQ` + `Redis` + `Resend`):**
+   - Evaluates active `AlertRule` records over a sliding time window (`windowMinutes`).
+   - Enforces a minimum traffic guard (`minRequests`) to avoid low-volume false positives and a cooldown period (`cooldownMinutes`) via `AlertLog` to prevent email spam.
+   - Enqueues breached alerts into the `alert-emails` BullMQ queue (5 retries with exponential backoff), processed by `alertEmailWorker` to send endpoint failure summaries via Resend.
 
 ---
 
 ## Tech Stack
 
-- **Runtime & Framework:** [Node.js](https://nodejs.org/), [Express 5](https://expressjs.com/), [TypeScript](https://www.typescriptlang.org/) (`ES2022` / `NodeNext`)
-- **Database & ORM:** [PostgreSQL](https://www.postgresql.org/) + [Prisma ORM v6](https://www.prisma.io/)
-- **Real-Time Streaming:** [Socket.IO v4](https://socket.io/)
-- **Distributed Queue & Caching:** [Redis (`ioredis`)](https://github.com/redis/ioredis) + [BullMQ v5](https://docs.bullmq.io/)
-- **Transactional Email Service:** [Resend](https://resend.com/)
-- **Authentication & Security:** [JSON Web Tokens (`jsonwebtoken`)](https://github.com/auth0/node-jsonwebtoken), [bcrypt](https://github.com/kelektiv/node.bcrypt.js), [Google Auth Library (`google-auth-library`)](https://github.com/googleapis/google-auth-library-nodejs)
-- **API Documentation:** OpenAPI 3.0 + [Swagger UI Express](https://github.com/scottie1984/swagger-ui-express)
+- **Runtime & Framework:** Node.js, Express 5, TypeScript
+- **Database & ORM:** PostgreSQL + Prisma ORM
+- **Real-Time Server:** Socket.IO
+- **Queue & Background Jobs:** Redis (`ioredis`) + BullMQ
+- **Transactional Emails:** Resend
+- **Authentication:** JWT (`jsonwebtoken`), `bcrypt`, Google OAuth 2.0 (`google-auth-library`)
+- **API Documentation:** OpenAPI 3.0 / Swagger UI (`swagger-ui-express`)
+
+---
+
+## REST API Overview
+
+> Full interactive documentation and request/response schemas are available at [`/api-docs`](https://requestlens-backend.onrender.com/api-docs).
+
+| Group | Method & Route | Auth | Purpose |
+| :--- | :--- | :---: | :--- |
+| **Auth** | `POST /api/auth/register` | Public | Register with `{ email, password }` and receive a JWT |
+| | `POST /api/auth/login` | Public | Log in with `{ email, password }` and receive a JWT |
+| | `POST /api/auth/google` | Public | Authenticate with a Google `{ idToken }` and receive a JWT |
+| **Projects** | `GET /api/projects` | `JWT` | List all projects and API keys for the current user |
+| | `POST /api/projects` | `JWT` | Create a project, generate its `ApiKey`, and seed a default alert rule |
+| | `GET /api/projects/:id` | `JWT` | Get project details and API key |
+| | `DELETE /api/projects/:id` | `JWT` | Delete a project and cascade-delete all associated data |
+| **Analytics & Logs** | `GET /api/projects/:projectId/stats` | `JWT` | Get KPI totals, 7-day traffic chart, and per-endpoint metrics |
+| | `GET /api/projects/:id/logs` | `JWT` | Get paginated request logs (`?page=1&limit=10`) |
+| **Endpoints** | `GET /api/projects/:projectId/endpoints` | `JWT` | List registered HTTP endpoints for a project |
+| | `POST /api/projects/:projectId/endpoints` | `JWT` | Register an endpoint (`{ name, path, method }`) |
+| | `DELETE /api/projects/:projectId/endpoints/:endpointId` | `JWT` | Delete a registered endpoint |
+| **Alerts** | `GET /api/projects/:projectId/alerts` | `JWT` | List `5xx` alert rules for a project |
+| | `POST /api/projects/:projectId/alerts` | `JWT` | Create a custom `5xx` threshold alert rule |
+| | `PATCH /api/projects/:projectId/alerts/:ruleId` | `JWT` | Toggle `active` status of an alert rule |
+| | `DELETE /api/projects/:projectId/alerts/:ruleId` | `JWT` | Delete an alert rule |
+| **Ingestion** | `POST /api/logs` | `API Key` | Ingest `{ endpointId, statusCode, responseTime }`, emit via Socket.IO & evaluate alerts |
 
 ---
 
@@ -266,52 +92,19 @@ erDiagram
 ```text
 requestlens-backend/
 ├── prisma/
-│   ├── migrations/                       # SQL migration history (init, indexes, alert system)
-│   └── schema.prisma                     # PostgreSQL data models & relations
+│   ├── migrations/              # SQL migration history
+│   └── schema.prisma            # PostgreSQL models (User, Project, Endpoint, ApiLog, ApiKey, AlertRule, AlertLog)
 ├── src/
-│   ├── controllers/
-│   │   ├── alert.controller.ts           # CRUD & toggle handlers for 5xx AlertRules
-│   │   ├── auth.controller.ts            # Register, Login & Google OAuth controllers
-│   │   ├── endpoint.controller.ts        # Endpoint registration & management handlers
-│   │   ├── logs.controller.ts            # Telemetry ingestion handler (POST /api/logs)
-│   │   ├── project.controller.ts         # Project lifecycle & paginated log controllers
-│   │   └── stats.controller.ts           # Dashboard analytics & aggregation controller
-│   ├── middlewares/
-│   │   ├── apiKey.middleware.ts          # Validates project Bearer <API_KEY> for ingestion
-│   │   ├── auth.middleware.ts            # Validates user Bearer <JWT> for dashboard routes
-│   │   └── monitor.middleware.ts         # Built-in self-monitoring & route auto-discovery
-│   ├── migrations/
-│   │   └── backfill-alerts.ts            # One-off utility to backfill default AlertRules
-│   ├── queues/
-│   │   ├── alertQueue.ts                 # BullMQ 'alert-emails' queue & exponential backoff config
-│   │   └── alertWorker.ts                # Background worker rendering & sending HTML emails via Resend
-│   ├── routes/
-│   │   ├── alert.routes.ts               # /api/projects/:projectId/alerts routes
-│   │   ├── auth.routes.ts                # /api/auth routes
-│   │   ├── endpoint.routes.ts            # /api/projects/:projectId/endpoints routes
-│   │   ├── logs.routes.ts                # /api/logs ingestion route
-│   │   ├── project.routes.ts             # /api/projects routes
-│   │   └── stats.routes.ts               # /api/projects/:projectId/stats route
-│   ├── services/
-│   │   ├── alert.service.ts              # Sliding-window 5xx evaluation & cooldown logic
-│   │   ├── auth.service.ts               # User registration, password checks & Google account linking
-│   │   ├── endpoint.service.ts           # Endpoint CRUD business logic
-│   │   ├── logs.service.ts               # Log persistence, Socket.IO broadcast & async alert trigger
-│   │   ├── project.service.ts            # Project provisioning, API key generation & log pagination
-│   │   └── stats.service.ts              # 7-day chart bucketing & Prisma groupBy endpoint metrics
-│   ├── utils/
-│   │   ├── google.ts                     # Google OAuth2Client ID token verification
-│   │   ├── hash.ts                       # bcrypt password hashing & comparison helpers
-│   │   ├── jwt.ts                        # JWT signing utility (1-day expiration)
-│   │   ├── prisma.ts                     # Singleton PrismaClient instance
-│   │   ├── redis.ts                      # Shared ioredis connection for BullMQ
-│   │   └── socket.ts                     # Socket.IO server initialization, JWT middleware & room emitter
-│   ├── app.ts                            # Express 5 app setup, middlewares, Swagger UI & route mounting
-│   ├── server.ts                         # HTTP server bootstrap, Socket.IO attachment & worker startup
-│   └── test-queue.ts                     # CLI script to test BullMQ + Resend email delivery
-├── swagger.json                          # OpenAPI 3.0 specification served at /api-docs
-├── package.json                          # Dependencies & build/dev scripts
-└── tsconfig.json                         # TypeScript compiler configuration
+│   ├── controllers/             # Express route handlers (auth, project, endpoint, logs, stats, alert)
+│   ├── middlewares/             # JWT auth, API key validation, and self-monitoring middleware
+│   ├── queues/                  # BullMQ queue ('alert-emails') and Resend email background worker
+│   ├── routes/                  # Express routers mounted in app.ts
+│   ├── services/                # Business logic, Prisma queries, and sliding-window alert evaluation
+│   ├── utils/                   # Prisma client, Redis connection, Socket.IO server, JWT, bcrypt & Google OAuth
+│   ├── app.ts                   # Express app configuration & Swagger UI setup
+│   └── server.ts                # HTTP server entry point, Socket.IO init & worker bootstrap
+├── swagger.json                 # OpenAPI 3.0 specification
+└── package.json
 ```
 
 ---
@@ -320,68 +113,35 @@ requestlens-backend/
 
 ### Prerequisites
 - **Node.js** `v20+` and `npm`
-- **PostgreSQL** database instance (local or hosted, e.g., Neon / Supabase / Render)
-- **Redis** instance (local or hosted, e.g., Upstash / Render Redis) for BullMQ background workers
+- **PostgreSQL** database and **Redis** instance
 
-### 1. Clone the Repository
+### 1. Clone & Install
 ```bash
 git clone https://github.com/faruqolatoyese/requestlens-backend.git
 cd requestlens-backend
-```
-
-### 2. Install Dependencies
-```bash
 npm install
 ```
 
-### 3. Configure Runtime Environment Variables
-Configure the following environment variables in your local environment before starting the server:
+### 2. Configure Environment Variables
+Set the following environment variables in your local environment:
 
-| Variable Name | Required | Description | Example Value |
-| :--- | :---: | :--- | :--- |
-| `PORT` | No | Port for the Express + Socket.IO HTTP server (defaults to `5000`) | `5000` |
-| `DATABASE_URL` | Yes | PostgreSQL connection string used by Prisma ORM | `postgresql://user:pass@localhost:5432/requestlens` |
-| `JWT_SECRET` | Yes | Secret key used to sign and verify 24-hour user JWT tokens | `your-super-secret-jwt-key` |
-| `REDIS_URL` | Yes | Redis connection URL used by `ioredis` and BullMQ queues/workers | `redis://localhost:6379` |
-| `GOOGLE_CLIENT_ID` | Yes | Google OAuth 2.0 Web Client ID (must match the frontend's client ID) | `your-google-client-id.apps.googleusercontent.com` |
-| `RESEND_API_KEY` | Optional | Resend API key for dispatching `5xx` alert emails (logs a warning if omitted) | `re_123456789_abcdefghijklmnop` |
-| `SELF_MONITORING_API_KEY` | Optional | Project API Key used by `monitorMiddleware` for self-monitoring | `a1b2c3d4...` |
+| Variable Name | Required | Description |
+| :--- | :---: | :--- |
+| `PORT` | No | Server port (defaults to `5000`) |
+| `DATABASE_URL` | Yes | PostgreSQL connection string for Prisma ORM |
+| `JWT_SECRET` | Yes | Secret key used to sign and verify JWT tokens |
+| `REDIS_URL` | Yes | Redis connection URL for BullMQ queues and workers |
+| `GOOGLE_CLIENT_ID` | Yes | Google OAuth 2.0 Web Client ID |
+| `RESEND_API_KEY` | Optional | Resend API key for dispatching `5xx` alert emails |
+| `SELF_MONITORING_API_KEY` | Optional | Project API Key used by `monitorMiddleware` for self-monitoring |
 
-### 4. Run Database Migrations & Generate Prisma Client
+### 3. Run Database Migrations & Start Server
 ```bash
 npx prisma migrate dev
-npx prisma generate
-```
-
-### 5. Start the Development Server
-```bash
 npm run dev
 ```
-- **API Base URL:** [http://localhost:5000](http://localhost:5000)
-- **Swagger UI Docs:** [http://localhost:5000/api-docs](http://localhost:5000/api-docs)
-
-### 6. Build & Run for Production
-```bash
-npm run build
-npm run start
-```
-
----
-
-## Example Telemetry Ingestion (`POST /api/logs`)
-
-Once you create a project and register an endpoint in the [RequestLens Frontend Dashboard](https://requestlens-frontend.vercel.app), you can stream live telemetry logs from any service:
-
-```bash
-curl -X POST https://requestlens-backend.onrender.com/api/logs \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <YOUR_PROJECT_API_KEY>" \
-  -d '{
-    "endpointId": "<YOUR_ENDPOINT_UUID>",
-    "statusCode": 200,
-    "responseTime": 142
-  }'
-```
+- **API Server:** `http://localhost:5000`
+- **Swagger Docs:** `http://localhost:5000/api-docs`
 
 ---
 
